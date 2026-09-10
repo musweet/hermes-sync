@@ -1,0 +1,25 @@
+# ---- Sensitive / credentials: NEVER commit ----
+.env
+auth.json
+config.yaml
+state.db
+state.db-*
+SOUL.md
+
+# ---- Synced Hermes state (machine-specific, not source code) ----
+meta.json
+memories/
+cron/
+skills/
+
+# ---- Syncthing internal state ----
+.stfolder/
+
+# ---- Editor / OS / Python noise ----
+__pycache__/
+*.pyc
+*.lock
+*.tmp
+*.partial
+.DS_Store
+Thumbs.db
