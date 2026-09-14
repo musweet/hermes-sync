@@ -517,7 +517,7 @@ def push(machine, local_latest):
 # ---------------------------------------------------------------------------
 # PULL：从同步文件夹拉取数据
 # ---------------------------------------------------------------------------
-def pull(machine, local_latest):
+def pull(machine, local_latest, force=False):
     log(f"开始 pull（machine={machine}）")
     if not (SYNC_DIR / "meta.json").exists():
         log("同步文件夹为空，无数据可拉取")
@@ -536,23 +536,27 @@ def pull(machine, local_latest):
     #   有基线 + 本机变了   → conflict（本机改动会被覆盖丢失）
     #   无基线 + 本机有数据 → conflict（--pull 强制路径绕过 decide()，这里兜底）
     #   无基线 + 本机无库   → 安全，可拉取
+    # force=True 时跳过冲突检查，直接覆盖本机（调用方已确认要保留远程）
     local_hash = db_logical_hash(str(HERMES_HOME / "state.db"))
     ls_hash = last_seen.get("hash")
-    if ls_hash and local_hash != ls_hash:
-        log(
-            f"检测到冲突：本机自上次同步({fmt_time(last_seen.get('timestamp', 0))})后"
-            f"内容已改变，与远程提交({fmt_time(remote_ts)})不同，无法安全覆盖",
-            "WARN",
-        )
-        return "conflict"
-    if not ls_hash and local_hash:
-        log(
-            "本机存在数据库但无同步基线（.last_seen 缺失），"
-            "无法确认本机改动是否已同步，拒绝覆盖",
-            "ERROR",
-        )
-        log("如确认要覆盖，请先备份本机数据后手动操作", "ERROR")
-        return "conflict"
+    if not force:
+        if ls_hash and local_hash != ls_hash:
+            log(
+                f"检测到冲突：本机自上次同步({fmt_time(last_seen.get('timestamp', 0))})后"
+                f"内容已改变，与远程提交({fmt_time(remote_ts)})不同，无法安全覆盖",
+                "WARN",
+            )
+            return "conflict"
+        if not ls_hash and local_hash:
+            log(
+                "本机存在数据库但无同步基线（.last_seen 缺失），"
+                "无法确认本机改动是否已同步，拒绝覆盖",
+                "ERROR",
+            )
+            log("如确认要覆盖，请先备份本机数据后手动操作", "ERROR")
+            return "conflict"
+    else:
+        log("--force 已指定，跳过冲突检查，强制保留远程版本", "WARN")
 
     log(f"应用远程提交 (from {remote_machine}, {fmt_time(remote_ts)}, hash={remote_hash[:16] if remote_hash else 'n/a'})")
 
@@ -825,12 +829,8 @@ def main():
 
     # 强制 pull
     if args.pull:
-        result = pull(machine, local_latest)
+        result = pull(machine, local_latest, force=args.force)
         if result == "conflict":
-            if args.force:
-                log("--force 已指定，但仍检测到冲突，走备份流程", "WARN")
-                handle_conflict(machine, local_latest)
-                return 2
             handle_conflict(machine, local_latest)
             return 2
         if result == "hermes-running":
