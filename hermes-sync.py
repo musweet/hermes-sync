@@ -145,6 +145,18 @@ def save_meta(meta):
     os.replace(str(tmp), str(SYNC_DIR / "meta.json"))
 
 
+def get_session_ids(db_path):
+    """返回数据库中所有 session id 集合。"""
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            return set(r[0] for r in con.execute("SELECT id FROM sessions"))
+        finally:
+            con.close()
+    except Exception:
+        return set()
+
+
 # ---------------------------------------------------------------------------
 # last_seen 读写（本机上次拉取的时间戳，记录在 LOCAL_DIR 下，不同步）
 # ---------------------------------------------------------------------------
@@ -325,6 +337,31 @@ def db_logical_hash(db_path):
             con.close()
     except Exception as e:
         log(f"计算数据库哈希失败: {e}", "WARN")
+        return None
+
+
+def db_session_hash(db_path, session_id):
+    """计算某个会话的内容哈希（按消息行排序）。
+
+    用于判定"某个会话自上次同步后是否被修改过"。
+    同一会话内容相同 → 哈希相同；内容变了 → 哈希不同。
+    """
+    if not os.path.exists(db_path):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = con.execute(
+                "SELECT role, content, tool_calls, tool_name "
+                "FROM messages WHERE session_id=? ORDER BY rowid",
+                (session_id,),
+            ).fetchall()
+            h = hashlib.sha256()
+            h.update(repr(rows).encode("utf-8"))
+            return h.hexdigest()
+        finally:
+            con.close()
+    except Exception:
         return None
 
 
@@ -637,16 +674,180 @@ def pull(machine, local_latest, force=False):
 # ---------------------------------------------------------------------------
 # 冲突处理：备份双方版本，不自动合并
 # ---------------------------------------------------------------------------
-def handle_conflict(machine, local_latest):
-    log("=" * 50, "WARN")
-    log("检测到冲突：两台机器在相同时间窗内都有修改，无法安全自动合并", "WARN")
-    log("=" * 50, "WARN")
-    log("正在备份双方版本，请你人工决定保留哪一个。", "WARN")
-    log("说明：SQLite 数据库无法做内容级合并，自动合并会丢消息。", "WARN")
+def try_merge_db(local_db_path, remote_db_path):
+    """尝试按会话合并两个数据库。
 
+    逻辑：
+      - 只在本地有的会话 → 保留（已是本地 DB 的一部分）
+      - 只在远程有的会话 → 复制过来（含所有消息）
+      - 两边都有且哈希相同 → 无需操作
+      - 两边都有但哈希不同 → 真冲突，无法自动合并
+
+    返回:
+      "merged"    — 成功合并，local_db_path 已是合并结果
+      "conflict"  — 存在真冲突，未做任何修改
+      "error"     — 合并过程出错，未做任何修改
+    """
+    local_ids = get_session_ids(local_db_path)
+    remote_ids = get_session_ids(remote_db_path)
+
+    # 两边共有的会话，检查是否有内容差异（真冲突）
+    shared = local_ids & remote_ids
+    real_conflicts = []
+    for sid in shared:
+        local_h = db_session_hash(local_db_path, sid)
+        remote_h = db_session_hash(remote_db_path, sid)
+        if local_h != remote_h:
+            real_conflicts.append(sid)
+
+    if real_conflicts:
+        log(f"发现 {len(real_conflicts)} 个会话内容冲突（两边都修改了同一会话）", "WARN")
+        for sid in real_conflicts[:5]:
+            log(f"  冲突会话: {sid}", "WARN")
+        return "conflict"
+
+    # 没有真冲突，可以自动合并
+    remote_only = remote_ids - local_ids
+    local_only = local_ids - remote_ids
+    if not remote_only:
+        log("远程无独有会话，无需合并")
+        return "merged"
+
+    log(f"检测到可合并冲突: 远程有 {len(remote_only)} 个独有会话，"
+        f"本地有 {len(local_only)} 个独有会话，两边共 {len(shared)} 个会话内容一致")
+
+    # 合并策略：以本地为基底，把远程独有的会话 + 消息复制过来
+    try:
+        con = sqlite3.connect(str(local_db_path), timeout=15)
+        con.execute("ATTACH DATABASE ? AS remote", (str(remote_db_path),))
+        try:
+            # 1. 复制 sessions 表中远程独有的会话行
+            n_sess = 0
+            s_cols = [r[1] for r in con.execute("PRAGMA remote.table_info(sessions)")]
+            col_s = ",".join('"' + c + '"' for c in s_cols)
+            ph_s = ",".join("?" * len(s_cols))
+            for sid in remote_only:
+                remote_row = con.execute(
+                    "SELECT " + col_s + " FROM remote.sessions WHERE id=?", (sid,)
+                ).fetchone()
+                if remote_row:
+                    con.execute(
+                        "INSERT INTO sessions (" + col_s + ") VALUES (" + ph_s + ")",
+                        remote_row,
+                    )
+                    n_sess += 1
+
+            # 2. 复制 messages 表中这些会话的所有消息
+            n_msg = 0
+            m_cols = [r[1] for r in con.execute("PRAGMA remote.table_info(messages)")]
+            col_m = ",".join('"' + c + '"' for c in m_cols)
+            ph_m = ",".join("?" * len(m_cols))
+            for sid in remote_only:
+                remote_rows = con.execute(
+                    "SELECT " + col_m + " FROM remote.messages WHERE session_id=?", (sid,)
+                ).fetchall()
+                for row in remote_rows:
+                    con.execute(
+                        "INSERT INTO messages (" + col_m + ") VALUES (" + ph_m + ")",
+                        row,
+                    )
+                    n_msg += 1
+
+            con.commit()
+            log(f"合并完成: 从远程导入 {n_sess} 个会话, {n_msg} 条消息")
+            return "merged"
+        finally:
+            con.close()
+    except Exception as e:
+        log(f"合并失败: {e}", "ERROR")
+        return "error"
+
+
+# ---------------------------------------------------------------------------
+# 冲突处理：先尝试自动合并，只有真冲突才备份退出
+# ---------------------------------------------------------------------------
+def handle_conflict(machine, local_latest):
     conflict_dir = LOCAL_DIR / "conflicts"
     conflict_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    local_db = HERMES_HOME / "state.db"
+    remote_db = SYNC_DIR / "state.db"
+
+    # 生成临时副本用于合并（不动原文件）
+    local_tmp = conflict_dir / f"merge-local-{ts}.db"
+    remote_tmp = conflict_dir / f"merge-remote-{ts}.db"
+
+    local_ok = False
+    if local_db.exists():
+        try:
+            con = sqlite3.connect(str(local_db), timeout=15)
+            try:
+                con.execute("VACUUM INTO ?", (str(local_tmp),))
+            finally:
+                con.close()
+            local_ok = True
+        except Exception as e:
+            log(f"本机快照失败: {e}", "ERROR")
+
+    remote_ok = False
+    if remote_db.exists():
+        try:
+            shutil.copy2(str(remote_db), str(remote_tmp))
+            remote_ok = True
+        except Exception as e:
+            log(f"远程副本失败: {e}", "ERROR")
+
+    if not (local_ok and remote_ok):
+        log("无法生成临时副本，回退到备份模式", "ERROR")
+        _backup_conflict(machine, local_latest, conflict_dir, ts)
+        return "conflict"
+
+    # 尝试合并
+    result = try_merge_db(str(local_tmp), str(remote_tmp))
+
+    if result == "conflict":
+        # 真冲突，回退到备份模式
+        _backup_conflict(machine, local_latest, conflict_dir, ts)
+        return "conflict"
+
+    if result == "error":
+        _backup_conflict(machine, local_latest, conflict_dir, ts)
+        return "conflict"
+
+    # 合并成功 — 替换本机数据库（需先检查 Hermes 是否运行）
+    running, matched = hermes_running()
+    if running:
+        log("合并成功但 Hermes 仍在运行，无法替换 state.db", "WARN")
+        log("合并结果已生成: " + str(local_tmp), "WARN")
+        log("请关闭 Hermes 后重跑同步，或手动将合并结果复制为 state.db", "WARN")
+        return "conflict"
+
+    try:
+        os.replace(str(local_tmp), str(local_db))
+        for suf in EXCLUDE_WAL_SUFFIXES:
+            p = str(local_db) + suf
+            if os.path.exists(p):
+                os.unlink(p)
+        log(f"合并后 state.db 已替换本机数据库", "WARN")
+    except Exception as e:
+        log(f"替换 state.db 失败: {e}", "ERROR")
+        _backup_conflict(machine, local_latest, conflict_dir, ts)
+        return "conflict"
+
+    # 合并成功，清理临时文件
+    if remote_tmp.exists():
+        remote_tmp.unlink()
+    return "merged"
+
+
+def _backup_conflict(machine, local_latest, conflict_dir, ts):
+    """原始备份逻辑：备份双方版本，不自动合并。"""
+    log("=" * 50, "WARN")
+    log("检测到冲突：两台机器在相同时间窗内都修改了同一会话，无法安全自动合并", "WARN")
+    log("=" * 50, "WARN")
+    log("正在备份双方版本，请你人工决定保留哪一个。", "WARN")
+    log("说明：SQLite 数据库无法在内容级合并，自动合并会丢消息。", "WARN")
 
     # 1. 本机 state.db 快照
     src_db = HERMES_HOME / "state.db"
@@ -694,7 +895,6 @@ def handle_conflict(machine, local_latest):
     log("  方式 A（保留远程）：python hermes-sync.py --pull --force", "WARN")
     log("  方式 B（保留本机）：关闭 Hermes 后从备份恢复，或重跑 --push", "WARN")
     log("  方式 C（人工合并）：手动比较两个 .db 文件后决定", "WARN")
-    return "conflict"
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +1031,12 @@ def main():
     if args.pull:
         result = pull(machine, local_latest, force=args.force)
         if result == "conflict":
-            handle_conflict(machine, local_latest)
+            result = handle_conflict(machine, local_latest)
+            if result == "merged":
+                local_hash = db_logical_hash(str(HERMES_HOME / "state.db"))
+                meta = load_meta()
+                save_last_seen(meta.get("timestamp", 0), local_hash, machine)
+                return 0
             return 2
         if result == "hermes-running":
             return 1
@@ -864,14 +1069,24 @@ def main():
         log("远程有新修改，执行 pull")
         result = pull(machine, local_latest)
         if result == "conflict":
-            handle_conflict(machine, local_latest)
+            result = handle_conflict(machine, local_latest)
+            if result == "merged":
+                local_hash = db_logical_hash(str(HERMES_HOME / "state.db"))
+                meta = load_meta()
+                save_last_seen(meta.get("timestamp", 0), local_hash, machine)
+                return 0
             return 2
         if result == "hermes-running":
             return 1
         return 0 if result not in ("db-busy", "db-error") else 1
 
     if action == "conflict":
-        handle_conflict(machine, local_latest)
+        result = handle_conflict(machine, local_latest)
+        if result == "merged":
+            local_hash = db_logical_hash(str(HERMES_HOME / "state.db"))
+            meta = load_meta()
+            save_last_seen(meta.get("timestamp", 0), local_hash, machine)
+            return 0
         return 2
 
     return 0
